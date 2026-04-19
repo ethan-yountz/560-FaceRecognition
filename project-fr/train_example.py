@@ -349,6 +349,7 @@ def train(args):
     best_train_loss = None
 
     for epoch in range(args.epochs):
+        epoch_start = time.time()
         model.train()
         if hasattr(criterion, "train"):
             criterion.train()
@@ -383,7 +384,8 @@ def train(args):
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
 
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch + 1}: avg_loss={avg_loss:.4f}")
+        epoch_seconds = time.time() - epoch_start
+        print(f"Epoch {epoch + 1}: avg_loss={avg_loss:.4f}, time={epoch_seconds:.2f}s")
 
         performance = evaluate_model(model, args, device)
         trial_metric = None
@@ -398,6 +400,7 @@ def train(args):
         history_entry = {
             "epoch": epoch + 1,
             "train_loss": avg_loss,
+            "epoch_seconds": epoch_seconds,
             "lr": scheduler.get_last_lr()[0],
             "val_performance": performance,
         }
