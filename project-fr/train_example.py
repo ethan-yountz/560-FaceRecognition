@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -369,7 +370,7 @@ def train(args):
             criterion.train()
 
         running_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", file=sys.stdout, dynamic_ncols=True)
         for images, labels in pbar:
             images = images.to(device, non_blocking=(device.type == "cuda"))
             labels = labels.to(device, non_blocking=(device.type == "cuda"))
