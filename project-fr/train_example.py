@@ -308,11 +308,13 @@ def summary_validation_metrics(performance):
 
 
 def train(args):
+    train_start = time.time()
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     amp_enabled = args.amp and device.type == "cuda"
 
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.cuda.reset_peak_memory_stats()
 
     train_dataset = FaceTrainDataset(
         args.data_root,
@@ -455,6 +457,15 @@ def train(args):
         if (epoch + 1) % args.save_every == 0:
             torch.save(checkpoint_payload(epoch, model, optimizer, args, save_extra), save_dir / f"checkpoint_epoch{epoch + 1}.pth")
 
+    total_time_seconds = time.time() - train_start
+    train_images_seen = len(train_loader) * args.batch_size * args.epochs
+    train_images_per_second = train_images_seen / max(total_time_seconds, 1e-8)
+    throughput_images_per_second = (
+        best_performance.get("eval_images_per_second")
+        if best_performance is not None and best_performance.get("eval_images_per_second") is not None
+        else train_images_per_second
+    )
+
     summary = {
         "args": vars(args),
         "num_train_images": len(train_dataset),
@@ -465,13 +476,35 @@ def train(args):
         "best_select_metric_name": args.select_metric if best_performance is not None else None,
         "best_val_performance": best_performance,
         "history": history,
+        "embedding_size": args.embedding_dim,
+        "total_time_seconds": total_time_seconds,
+        "train_images_per_second": train_images_per_second,
+        "throughput_images_per_second": throughput_images_per_second,
     }
+    if device.type == "cuda":
+        summary["peak_gpu_memory_allocated_mb"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        summary["peak_gpu_memory_reserved_mb"] = torch.cuda.max_memory_reserved() / (1024 ** 2)
     summary.update({key: value for key, value in summary_validation_metrics(best_performance).items() if value is not None})
 
     with open(save_dir / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
     print(f"\nTraining complete. Best epoch: {best_epoch}")
+    if best_performance is not None:
+        print(f"TAR@FAR=1e-6: {summary.get('TAR@FAR=1e-6', 0):.2f}%")
+        print(f"TAR@FAR=1e-5: {summary.get('TAR@FAR=1e-5', 0):.2f}%")
+        print(f"TAR@FAR=1e-4: {summary.get('TAR@FAR=1e-4', 0):.2f}%")
+        print(f"TAR@FAR=1e-3: {summary.get('TAR@FAR=1e-3', 0):.2f}%")
+        print(f"AUC: {summary.get('AUC', 0):.2f}%")
+    print(f"Throughput: {throughput_images_per_second:.2f} images/s")
+    if device.type == "cuda":
+        print(
+            "Peak GPU memory: "
+            f"{summary['peak_gpu_memory_reserved_mb']:.2f} MB reserved "
+            f"({summary['peak_gpu_memory_allocated_mb']:.2f} MB allocated)"
+        )
+    print(f"Embedding size: {args.embedding_dim}")
+    print(f"Total time: {total_time_seconds:.2f} s")
     print(f"Artifacts saved to: {save_dir}")
     return summary
 
