@@ -287,6 +287,20 @@ def metric_value(name, performance):
     return float(performance[name])
 
 
+def summary_validation_metrics(performance):
+    if performance is None:
+        return {}
+    return {
+        "AUC": performance.get("AUC"),
+        "TAR@FAR=1e-6": performance.get("TAR@FAR=1e-6"),
+        "TAR@FAR=1e-5": performance.get("TAR@FAR=1e-5"),
+        "TAR@FAR=1e-4": performance.get("TAR@FAR=1e-4"),
+        "TAR@FAR=1e-3": performance.get("TAR@FAR=1e-3"),
+        "eval_time_seconds": performance.get("eval_time_seconds"),
+        "eval_images_per_second": performance.get("eval_images_per_second"),
+    }
+
+
 def train(args):
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     amp_enabled = args.amp and device.type == "cuda"
@@ -436,6 +450,7 @@ def train(args):
         "best_val_performance": best_performance,
         "history": history,
     }
+    summary.update({key: value for key, value in summary_validation_metrics(best_performance).items() if value is not None})
 
     with open(save_dir / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
