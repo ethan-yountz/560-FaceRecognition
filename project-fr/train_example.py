@@ -375,8 +375,10 @@ def train(args):
             criterion.train()
 
         running_loss = 0.0
+        num_batches = len(train_loader)
+        log_interval = max(1, num_batches // 20)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", file=sys.stdout, dynamic_ncols=True)
-        for images, labels in pbar:
+        for batch_idx, (images, labels) in enumerate(pbar, start=1):
             images = images.to(device, non_blocking=(device.type == "cuda"))
             labels = labels.to(device, non_blocking=(device.type == "cuda"))
 
@@ -402,6 +404,14 @@ def train(args):
 
             running_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
+            if batch_idx % log_interval == 0 or batch_idx == num_batches:
+                elapsed = time.time() - epoch_start
+                avg_batch_time = elapsed / batch_idx
+                remaining = avg_batch_time * (num_batches - batch_idx)
+                print(
+                    f"  Epoch {epoch + 1}/{args.epochs} batch {batch_idx}/{num_batches} "
+                    f"loss={loss.item():.4f} elapsed={elapsed:.1f}s eta={remaining:.1f}s"
+                )
 
         avg_loss = running_loss / len(train_loader)
         epoch_seconds = time.time() - epoch_start
