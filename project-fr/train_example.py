@@ -205,7 +205,19 @@ def train(args):
 
     best_loss = float('inf')
 
-    for epoch in range(args.epochs):
+    # Resume training (generated with MS Copilot)
+    start_epoch = 0
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_loss = checkpoint.get('loss', float('inf'))
+        print(f"Resumed from checkpoint {args.resume} at epoch {start_epoch}. The best loss is now {best_loss}.")
+
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         if hasattr(criterion, 'train'):
             criterion.train()
@@ -239,6 +251,7 @@ def train(args):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
                 'embedding_dim': args.embedding_dim,
             }, save_dir / "best_model.pth")
@@ -250,6 +263,7 @@ def train(args):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
                 'embedding_dim': args.embedding_dim,
             }, save_dir / f"checkpoint_epoch{epoch+1}.pth")
@@ -395,6 +409,7 @@ def main():
     parser.add_argument("--warmup_epochs", type=int, default=2, help="Warmup epochs")
     parser.add_argument("--margin", type=float, default=0.3, help="Triplet loss margin")
     parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
 
     # Prediction args
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/best_model.pth", help="Checkpoint path for prediction")
