@@ -291,12 +291,17 @@ def metric_value(name, performance):
 def summary_validation_metrics(performance):
     if performance is None:
         return {}
+    def metric(*names):
+        for name in names:
+            if name in performance:
+                return performance.get(name)
+        return None
     return {
         "AUC": performance.get("AUC"),
-        "TAR@FAR=1e-6": performance.get("TAR@FAR=1e-6"),
-        "TAR@FAR=1e-5": performance.get("TAR@FAR=1e-5"),
-        "TAR@FAR=1e-4": performance.get("TAR@FAR=1e-4"),
-        "TAR@FAR=1e-3": performance.get("TAR@FAR=1e-3"),
+        "TAR@FAR=1e-6": metric("TAR@FAR=1e-6", "TAR@FAR=1e-06"),
+        "TAR@FAR=1e-5": metric("TAR@FAR=1e-5", "TAR@FAR=1e-05"),
+        "TAR@FAR=1e-4": metric("TAR@FAR=1e-4", "TAR@FAR=1e-04"),
+        "TAR@FAR=1e-3": metric("TAR@FAR=1e-3", "TAR@FAR=1e-03"),
         "eval_time_seconds": performance.get("eval_time_seconds"),
         "eval_images_per_second": performance.get("eval_images_per_second"),
     }
