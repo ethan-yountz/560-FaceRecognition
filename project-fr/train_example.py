@@ -321,6 +321,66 @@ def validate_backbone_args(backbone, embedding_dim):
         raise ValueError("Exact MobileFaceNet uses a 128-dimensional embedding. Set --embedding_dim 128.")
 
 
+def default_split_paths(data_root):
+    split_dir = Path(data_root) / "splits" / "val_15_seed42"
+    return {
+        "train_metadata": split_dir / "train_metadata.parquet",
+        "val_metadata": split_dir / "val_metadata.parquet",
+        "val_pairs": split_dir / "val_pairs.parquet",
+    }
+
+
+def prepare_training_args(args):
+    if (args.val_metadata is None) != (args.val_pairs is None):
+        raise ValueError("Provide both --val_metadata and --val_pairs, or neither.")
+
+    if args.allow_benchmark_training:
+        if args.train_metadata is None:
+            args.train_metadata = "test.parquet"
+        if args.val_metadata is not None or args.val_pairs is not None:
+            raise ValueError(
+                "--allow_benchmark_training is only supported without validation inputs. "
+                "Do not pass --val_metadata or --val_pairs."
+            )
+        return args
+
+    split_paths = default_split_paths(args.data_root)
+    if args.train_metadata is None:
+        missing = [str(path) for path in split_paths.values() if not path.exists()]
+        if missing:
+            raise ValueError(
+                "Training now requires a held-out split instead of benchmark files. "
+                f"Missing split files: {missing}. "
+                f"Run: python make_validation_split.py --dataset_root {args.data_root}"
+            )
+        args.train_metadata = str(split_paths["train_metadata"])
+        args.val_metadata = args.val_metadata or str(split_paths["val_metadata"])
+        args.val_pairs = args.val_pairs or str(split_paths["val_pairs"])
+        print(f"Using held-out split from: {split_paths['train_metadata'].parent}")
+
+    train_metadata_path = resolve_path(args.data_root, args.train_metadata)
+    val_metadata_path = resolve_path(args.data_root, args.val_metadata) if args.val_metadata else None
+    val_pairs_path = resolve_path(args.data_root, args.val_pairs) if args.val_pairs else None
+
+    if train_metadata_path.name == "test.parquet":
+        raise ValueError(
+            "Refusing to train on benchmark metadata 'test.parquet'. "
+            "Use a held-out split such as splits/val_15_seed42/train_metadata.parquet."
+        )
+    if val_metadata_path and val_metadata_path.name == "test.parquet":
+        raise ValueError(
+            "Refusing to validate on benchmark metadata 'test.parquet'. "
+            "Use a held-out split such as splits/val_15_seed42/val_metadata.parquet."
+        )
+    if val_pairs_path and val_pairs_path.name == "pairs.parquet":
+        raise ValueError(
+            "Refusing to select checkpoints on benchmark labels from 'pairs.parquet'. "
+            "Use a held-out split such as splits/val_15_seed42/val_pairs.parquet."
+        )
+
+    return args
+
+
 def train(args):
     validate_backbone_args(args.backbone, args.embedding_dim)
     train_start = time.time()
@@ -393,7 +453,6 @@ def train(args):
 
         running_loss = 0.0
         num_batches = len(train_loader)
-        log_interval = max(1, num_batches // 20)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", file=sys.stdout, dynamic_ncols=True)
         for batch_idx, (images, labels) in enumerate(pbar, start=1):
             images = images.to(device, non_blocking=(device.type == "cuda"))
@@ -421,14 +480,6 @@ def train(args):
 
             running_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
-            if batch_idx % log_interval == 0 or batch_idx == num_batches:
-                elapsed = time.time() - epoch_start
-                avg_batch_time = elapsed / batch_idx
-                remaining = avg_batch_time * (num_batches - batch_idx)
-                print(
-                    f"  Epoch {epoch + 1}/{args.epochs} batch {batch_idx}/{num_batches} "
-                    f"loss={loss.item():.4f} elapsed={elapsed:.1f}s eta={remaining:.1f}s"
-                )
 
         avg_loss = running_loss / len(train_loader)
         epoch_seconds = time.time() - epoch_start
@@ -573,7 +624,12 @@ def main():
     parser.add_argument("--predict", action="store_true", help="Generate predictions from a checkpoint")
 
     parser.add_argument("--data_root", type=str, default="./datasets/dataset_a", help="Dataset root for training")
-    parser.add_argument("--train_metadata", type=str, default="test.parquet", help="Training metadata parquet")
+    parser.add_argument(
+        "--train_metadata",
+        type=str,
+        default=None,
+        help="Training metadata parquet. Defaults to splits/val_15_seed42/train_metadata.parquet when available.",
+    )
     parser.add_argument("--val_metadata", type=str, default=None, help="Validation metadata parquet")
     parser.add_argument("--val_pairs", type=str, default=None, help="Validation pairs parquet")
     parser.add_argument("--label_column", type=str, default=None, help="Label column for training; defaults to component_id if present")
@@ -591,6 +647,11 @@ def main():
     parser.add_argument("--select_metric", type=str, default="AUC", help="Validation metric used to pick the best checkpoint")
     parser.add_argument("--no_augment", action="store_true", help="Disable training augmentations")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA")
+    parser.add_argument(
+        "--allow_benchmark_training",
+        action="store_true",
+        help="Explicit opt-in to train on test.parquet without validation. Intended only when evaluating on a different dataset.",
+    )
 
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/best_model.pth", help="Checkpoint path for prediction")
     parser.add_argument("--dataset_root", type=str, help="Dataset root for prediction")
@@ -618,6 +679,7 @@ def main():
             parser.error("--dataset_root is required for prediction mode")
         predict(args)
     else:
+        args = prepare_training_args(args)
         train(args)
 
 

@@ -121,8 +121,18 @@ def main():
         choices=["dataset_a", "dataset_b"],
         help="Datasets to evaluate on",
     )
+    parser.add_argument(
+        "--acknowledge_benchmark_labels",
+        action="store_true",
+        help="Required opt-in because this script reads labeled benchmark pairs.parquet files.",
+    )
 
     args = parser.parse_args()
+    if not args.acknowledge_benchmark_labels:
+        parser.error(
+            "Local evaluation reads labeled benchmark pairs.parquet files. "
+            "Re-run with --acknowledge_benchmark_labels only for an intentional one-shot evaluation."
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

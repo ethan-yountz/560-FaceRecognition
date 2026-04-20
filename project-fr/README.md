@@ -35,10 +35,10 @@ template_id_1,template_id_2,score
 
 ```bash
 # Evaluate on dataset_a
-python evaluate.py --student_id YOUR_ID --prediction predictions/dataset_a.csv --datasets dataset_a
+python evaluate.py --student_id YOUR_ID --prediction predictions/dataset_a.csv --datasets dataset_a --acknowledge_benchmark_labels
 
 # Evaluate on both (pass a directory containing dataset_a.csv and dataset_b.csv)
-python evaluate.py --student_id YOUR_ID --prediction predictions/ --datasets dataset_a dataset_b
+python evaluate.py --student_id YOUR_ID --prediction predictions/ --datasets dataset_a dataset_b --acknowledge_benchmark_labels
 ```
 
 ## Baseline
