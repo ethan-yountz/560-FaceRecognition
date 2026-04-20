@@ -43,11 +43,18 @@ python evaluate.py --student_id YOUR_ID --prediction predictions/ --datasets dat
 
 ## Baseline
 
-Generate baseline predictions using pretrained ResNet50:
+Generate baseline predictions using the pretrained ResNet50 baseline:
 
 ```bash
 python models/resnet_baseline.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a.csv
 python models/resnet_baseline.py --dataset_root ./datasets/dataset_b --output predictions/dataset_b.csv
+```
+
+Generate predictions from an exact MobileFaceNet checkpoint using the same CSV output and evaluation path:
+
+```bash
+python models/resnet_baseline.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a_mobilefacenet.csv --backbone mobilefacenet --checkpoint ./checkpoints_mobilefacenet/best_model.pth
+python models/resnet_baseline.py --dataset_root ./datasets/dataset_b --output predictions/dataset_b_mobilefacenet.csv --backbone mobilefacenet --checkpoint ./checkpoints_mobilefacenet/best_model.pth
 ```
 
 ## Training Example
@@ -59,11 +66,35 @@ python train_example.py --data_root ./datasets/dataset_a --loss arcface --epochs
 python train_example.py --data_root ./datasets/dataset_a --loss triplet --epochs 20
 ```
 
+Train the same pipeline with the exact MobileFaceNet architecture while preserving the same validation metrics (`TAR@FAR` and `AUC`):
+
+```bash
+python train_example.py --data_root ./datasets/dataset_a --loss arcface --epochs 20 --backbone mobilefacenet --embedding_dim 128
+python train_example.py --data_root ./datasets/dataset_a --loss triplet --epochs 20 --backbone mobilefacenet --embedding_dim 128
+```
+
 Generate predictions from a trained checkpoint:
 
 ```bash
 python train_example.py --predict --checkpoint ./checkpoints/best_model.pth --dataset_root ./datasets/dataset_a --output predictions/dataset_a.csv
 python train_example.py --predict --checkpoint ./checkpoints/best_model.pth --dataset_root ./datasets/dataset_b --output predictions/dataset_b.csv
+```
+
+Benchmark either backbone and save performance plus efficiency metrics to JSON:
+
+```bash
+python run_baseline_benchmark.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a.csv --metrics_output results/dataset_a_resnet50_metrics.json --backbone resnet50
+python run_baseline_benchmark.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a_mobilefacenet.csv --metrics_output results/dataset_a_mobilefacenet_metrics.json --backbone mobilefacenet --checkpoint ./checkpoints_mobilefacenet/best_model.pth
+```
+
+## Colab / Notebook Usage
+
+In a notebook cell, run the same scripts with `!python`. Because both backbones still write the same prediction CSV format and use `evaluate.py`, they report the same statistics as the existing ResNet50 path:
+
+```bash
+!python train_example.py --data_root ./datasets/dataset_a --train_metadata ./datasets/dataset_a/splits/val_15_seed42/train_metadata.parquet --val_metadata ./datasets/dataset_a/splits/val_15_seed42/val_metadata.parquet --val_pairs ./datasets/dataset_a/splits/val_15_seed42/val_pairs.parquet --loss arcface --epochs 5 --backbone mobilefacenet --embedding_dim 128 --device cuda
+
+!python run_baseline_benchmark.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a_mobilefacenet.csv --metrics_output results/dataset_a_mobilefacenet_metrics.json --backbone mobilefacenet --checkpoint ./checkpoints_mobilefacenet/best_model.pth --device cuda
 ```
 
 ## Metrics

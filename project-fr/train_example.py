@@ -33,6 +33,7 @@ from torchvision import models, transforms
 from tqdm import tqdm
 
 from evaluate import compute_tar_at_far
+from models.mobilefacenet import MobileFaceNet
 
 
 def resolve_path(root: str, value: str | None, default_name: str | None = None) -> Path | None:
@@ -167,13 +168,20 @@ class TripletLoss(nn.Module):
 
 
 class TrainableModel(nn.Module):
-    """ResNet50 backbone with a projection head."""
+    """Image backbone with a projection head suitable for face embeddings."""
 
-    def __init__(self, embedding_dim=512):
+    def __init__(self, embedding_dim=512, backbone_name="resnet50"):
         super().__init__()
-        self.backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        self.backbone.fc = nn.Linear(2048, embedding_dim)
+        self.backbone_name = backbone_name
         self._embedding_dim = embedding_dim
+
+        if backbone_name == "resnet50":
+            self.backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+            self.backbone.fc = nn.Linear(2048, embedding_dim)
+        elif backbone_name == "mobilefacenet":
+            self.backbone = MobileFaceNet(embedding_dim=embedding_dim)
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone_name}")
 
     @property
     def embedding_dim(self):
@@ -272,6 +280,7 @@ def checkpoint_payload(epoch, model, optimizer, args, extra=None):
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "backbone": args.backbone,
         "embedding_dim": args.embedding_dim,
         "args": vars(args),
     }
@@ -307,7 +316,13 @@ def summary_validation_metrics(performance):
     }
 
 
+def validate_backbone_args(backbone, embedding_dim):
+    if backbone == "mobilefacenet" and embedding_dim != 128:
+        raise ValueError("Exact MobileFaceNet uses a 128-dimensional embedding. Set --embedding_dim 128.")
+
+
 def train(args):
+    validate_backbone_args(args.backbone, args.embedding_dim)
     train_start = time.time()
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     amp_enabled = args.amp and device.type == "cuda"
@@ -335,7 +350,7 @@ def train(args):
 
     print(f"Training set: {len(train_dataset)} images, {train_dataset.num_classes} classes using label '{train_dataset.label_column}'")
 
-    model = TrainableModel(embedding_dim=args.embedding_dim).to(device)
+    model = TrainableModel(embedding_dim=args.embedding_dim, backbone_name=args.backbone).to(device)
 
     if args.loss == "arcface":
         criterion = ArcFaceLoss(args.embedding_dim, train_dataset.num_classes, s=args.arcface_s, m=args.arcface_m).to(device)
@@ -468,6 +483,7 @@ def train(args):
 
     summary = {
         "args": vars(args),
+        "backbone": args.backbone,
         "num_train_images": len(train_dataset),
         "num_train_classes": train_dataset.num_classes,
         "best_epoch": best_epoch,
@@ -503,6 +519,7 @@ def train(args):
             f"{summary['peak_gpu_memory_reserved_mb']:.2f} MB reserved "
             f"({summary['peak_gpu_memory_allocated_mb']:.2f} MB allocated)"
         )
+    print(f"Backbone: {args.backbone}")
     print(f"Embedding size: {args.embedding_dim}")
     print(f"Total time: {total_time_seconds:.2f} s")
     print(f"Artifacts saved to: {save_dir}")
@@ -514,10 +531,12 @@ def predict(args):
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     embedding_dim = checkpoint.get("embedding_dim", args.embedding_dim)
-    model = TrainableModel(embedding_dim=embedding_dim).to(device)
+    backbone_name = checkpoint.get("backbone") or checkpoint.get("args", {}).get("backbone", args.backbone)
+    validate_backbone_args(backbone_name, embedding_dim)
+    model = TrainableModel(embedding_dim=embedding_dim, backbone_name=backbone_name).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print(f"Loaded checkpoint: {args.checkpoint} (epoch {checkpoint.get('epoch', '?')})")
+    print(f"Loaded checkpoint: {args.checkpoint} (epoch {checkpoint.get('epoch', '?')}, backbone {backbone_name})")
 
     dataset = FaceEvalDataset(args.dataset_root, args.eval_metadata or "test.parquet", image_size=(args.image_size, args.image_size))
     dataloader = DataLoader(
@@ -579,6 +598,13 @@ def main():
     parser.add_argument("--eval_pairs", type=str, default=None, help="Evaluation pairs parquet for prediction mode")
     parser.add_argument("--output", type=str, default="predictions/dataset_a.csv", help="Output CSV path for predictions")
 
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="resnet50",
+        choices=["resnet50", "mobilefacenet"],
+        help="Backbone architecture for training or checkpoint reconstruction",
+    )
     parser.add_argument("--embedding_dim", type=int, default=512, help="Embedding dimension")
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch size")
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Evaluation batch size")

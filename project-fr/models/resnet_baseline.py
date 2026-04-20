@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-ResNet50 Baseline for Face Recognition
+Backbone baseline for face recognition.
 
-Generates prediction CSV files for evaluation. Uses pretrained ResNet50
+Generates prediction CSV files for evaluation. Uses a pretrained image backbone
 to encode face images, aggregates template features, and computes pair scores.
 
 Usage:
     python models/resnet_baseline.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a.csv
-    python models/resnet_baseline.py --dataset_root ./datasets/dataset_b --output predictions/dataset_b.csv
+    python models/resnet_baseline.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a_mobilefacenet.csv --backbone mobilefacenet --checkpoint ./checkpoints/best_model.pth
 """
 
 import argparse
 import os
 import time
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,11 @@ from torchvision import models, transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from tqdm import tqdm
+
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from models.mobilefacenet import MobileFaceNet
 
 
 class FaceDataset(Dataset):
@@ -54,11 +60,38 @@ class ResNetEncoder(nn.Module):
         self.device = device
         self.backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         self.backbone.fc = nn.Identity()
+        self.embedding_dim = 2048
         self.to(device).eval()
 
     @torch.inference_mode()
     def encode(self, images):
         return F.normalize(self.backbone(images.to(self.device)), p=2, dim=1)
+
+
+class MobileFaceNetEncoder(nn.Module):
+    def __init__(self, checkpoint_path, device="cuda"):
+        super().__init__()
+        self.device = device
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        embedding_dim = checkpoint.get("embedding_dim", 128)
+        self.backbone = MobileFaceNet(embedding_dim=embedding_dim)
+        self.backbone.load_state_dict(checkpoint["model_state_dict"])
+        self.embedding_dim = embedding_dim
+        self.to(device).eval()
+
+    @torch.inference_mode()
+    def encode(self, images):
+        return self.backbone.encode(images.to(self.device, non_blocking=self.device == "cuda"))
+
+
+def create_encoder(backbone, device="cuda", checkpoint_path=None):
+    if backbone == "resnet50":
+        return ResNetEncoder(device=device)
+    if backbone == "mobilefacenet":
+        if checkpoint_path is None:
+            raise ValueError("--checkpoint is required when --backbone mobilefacenet")
+        return MobileFaceNetEncoder(checkpoint_path=checkpoint_path, device=device)
+    raise ValueError(f"Unsupported backbone: {backbone}")
 
 
 def aggregate_template_features(embeddings, template_ids, media_ids):
@@ -81,9 +114,17 @@ def aggregate_template_features(embeddings, template_ids, media_ids):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ResNet50 Baseline - Generate Face Recognition Predictions")
+    parser = argparse.ArgumentParser(description="Backbone baseline - generate face recognition predictions")
     parser.add_argument("--dataset_root", type=str, required=True, help="Path to dataset directory")
     parser.add_argument("--output", type=str, required=True, help="Output CSV path")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="resnet50",
+        choices=["resnet50", "mobilefacenet"],
+        help="Image backbone used to produce embeddings",
+    )
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path required for MobileFaceNet inference")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--num_workers", type=int, default=4, help="Data loading workers")
@@ -99,10 +140,11 @@ def main():
 
     pairs_df = pd.read_parquet(os.path.join(args.dataset_root, "pairs.parquet"))
 
+    print(f"Backbone: {args.backbone}")
     print(f"Images: {len(dataset)}, Pairs: {len(pairs_df)}")
 
     # Encode
-    model = ResNetEncoder(args.device)
+    model = create_encoder(args.backbone, args.device, checkpoint_path=args.checkpoint)
     embeddings_list, indices_list = [], []
 
     for images, indices in tqdm(dataloader, desc="Encoding"):
