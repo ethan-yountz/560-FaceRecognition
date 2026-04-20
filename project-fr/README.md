@@ -73,6 +73,27 @@ python train_example.py --data_root ./datasets/dataset_a --loss arcface --epochs
 python train_example.py --data_root ./datasets/dataset_a --loss triplet --epochs 20 --backbone mobilefacenet --embedding_dim 128
 ```
 
+Run a Colab-friendly MobileFaceNet sweep that samples the most important training knobs for the exact 128-D backbone and writes ranked CSV/JSON summaries:
+
+```bash
+python run_mobilefacenet_sweep.py --data_root ./datasets/dataset_a --train_metadata ./datasets/dataset_a/splits/val_15_seed42/train_metadata.parquet --val_metadata ./datasets/dataset_a/splits/val_15_seed42/val_metadata.parquet --val_pairs ./datasets/dataset_a/splits/val_15_seed42/val_pairs.parquet --preset standard --amp --device cuda
+```
+
+The sweep varies:
+- learning rate
+- weight decay
+- batch size
+- ArcFace margin (`arcface_m`)
+- ArcFace scale (`arcface_s`)
+- warmup epochs
+
+Recommended sweep budgets on a single Colab GPU:
+- `quick`: 6 trials x 4 epochs for smoke testing
+- `standard`: 10 trials x 5 epochs for a useful first pass
+- `full`: 16 trials x 6 epochs when you can spend more GPU time
+
+After the sweep, retrain the best 1-2 configurations for roughly 12-20 epochs to get a more stable final ranking.
+
 Generate predictions from a trained checkpoint:
 
 ```bash
@@ -95,6 +116,8 @@ In a notebook cell, run the same scripts with `!python`. Because both backbones 
 !python train_example.py --data_root ./datasets/dataset_a --train_metadata ./datasets/dataset_a/splits/val_15_seed42/train_metadata.parquet --val_metadata ./datasets/dataset_a/splits/val_15_seed42/val_metadata.parquet --val_pairs ./datasets/dataset_a/splits/val_15_seed42/val_pairs.parquet --loss arcface --epochs 5 --backbone mobilefacenet --embedding_dim 128 --device cuda
 
 !python run_baseline_benchmark.py --dataset_root ./datasets/dataset_a --output predictions/dataset_a_mobilefacenet.csv --metrics_output results/dataset_a_mobilefacenet_metrics.json --backbone mobilefacenet --checkpoint ./checkpoints_mobilefacenet/best_model.pth --device cuda
+
+!python run_mobilefacenet_sweep.py --data_root ./datasets/dataset_a --train_metadata ./datasets/dataset_a/splits/val_15_seed42/train_metadata.parquet --val_metadata ./datasets/dataset_a/splits/val_15_seed42/val_metadata.parquet --val_pairs ./datasets/dataset_a/splits/val_15_seed42/val_pairs.parquet --preset standard --amp --device cuda
 ```
 
 ## Metrics
