@@ -138,7 +138,12 @@ class TrainableModel(nn.Module):
     def __init__(self, embedding_dim=512):
         super().__init__()
         self.backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        self.backbone.fc = nn.Linear(2048, embedding_dim)
+        self.backbone.fc = nn.Sequential(
+              nn.Linear(2048, 1024),
+              nn.BatchNorm1d(1024),
+              nn.ReLU(inplace=True),
+              nn.Linear(1024, embedding_dim),
+          )
         self._embedding_dim = embedding_dim
 
     @property
@@ -171,8 +176,13 @@ def train(args):
 
     # Model
     model = TrainableModel(embedding_dim=args.embedding_dim).to(device)
-
+    # Freeze backbone
+    for name, param in model.backbone.named_parameters():
+        param.requires_grad = False
+    # important: prevent BN running stats update
+    model.backbone.eval()
     # Loss
+
     if args.loss == "arcface":
         criterion = ArcFaceLoss(args.embedding_dim, dataset.num_classes).to(device)
     elif args.loss == "triplet":
@@ -181,7 +191,7 @@ def train(args):
         raise ValueError(f"Unknown loss: {args.loss}")
 
     # Optimizer
-    params = list(model.parameters())
+    params = list(model.backbone.fc.parameters())
     if hasattr(criterion, 'parameters'):
         params += list(criterion.parameters())
 
@@ -210,8 +220,8 @@ def train(args):
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        #scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_loss = checkpoint.get('loss', float('inf'))
         print(f"Resumed from checkpoint {args.resume} at epoch {start_epoch}. The best loss is now {best_loss}.")
