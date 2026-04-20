@@ -218,13 +218,20 @@ def train(args):
     # Resume training (generated with MS Copilot)
     start_epoch = 0
     if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        #scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint.get('loss', float('inf'))
-        print(f"Resumed from checkpoint {args.resume} at epoch {start_epoch}. The best loss is now {best_loss}.")
+       checkpoint = torch.load(args.resume, map_location=device)
+       state_dict = checkpoint['model_state_dict']
+
+       filtered_dict = {
+           k: v for k, v in state_dict.items()
+           if not k.startswith("backbone.fc")
+       }
+
+       model.load_state_dict(filtered_dict, strict=False)
+
+       start_epoch = checkpoint['epoch'] + 1
+       best_loss = checkpoint.get('loss', float('inf'))
+
+       print(f"Resumed from checkpoint {args.resume} at epoch {start_epoch}. The best loss is now {best_loss}.")
 
 
     for epoch in range(start_epoch, args.epochs):
