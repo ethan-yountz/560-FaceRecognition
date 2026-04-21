@@ -370,13 +370,17 @@ def train_command(args: argparse.Namespace) -> None:
     try:
         import asyncio
 
+        import blobfile
         import chz
+        import datasets
         from tinker_cookbook import cli_utils, model_info
+        from tinker_cookbook import renderers as tinker_renderers
+        from tinker_cookbook.image_processing_utils import get_image_processor
         from tinker_cookbook.recipes import sl_basic  # noqa: F401  # Keep import path honest.
         from tinker_cookbook.renderers import TrainOnWhat
         from tinker_cookbook.supervised import train as tinker_train
-        from tinker_cookbook.supervised.data import FromConversationFileBuilder
-        from tinker_cookbook.supervised.types import ChatDatasetBuilderCommonConfig
+        from tinker_cookbook.supervised.data import SupervisedDatasetFromHFDataset, conversation_to_datum
+        from tinker_cookbook.supervised.types import ChatDatasetBuilder, ChatDatasetBuilderCommonConfig, SupervisedDataset
     except ImportError as exc:
         raise SystemExit(
             "Tinker dependencies are not installed. Install with:\n"
@@ -385,15 +389,81 @@ def train_command(args: argparse.Namespace) -> None:
             f"Import failure: {exc}"
         ) from exc
 
+    @chz.chz
+    class VisionConversationFileBuilder(ChatDatasetBuilder):
+        file_path: str
+        test_size: int = 0
+        shuffle_seed: int = 0
+
+        @property
+        def renderer(self):
+            image_processor = get_image_processor(self.common_config.model_name_for_tokenizer)
+            return tinker_renderers.get_renderer(
+                self.common_config.renderer_name,
+                self.tokenizer,
+                image_processor=image_processor,
+                model_name=self.common_config.model_name_for_tokenizer,
+            )
+
+        def __call__(self) -> tuple[SupervisedDataset, SupervisedDataset | None]:
+            conversations_jsonl = []
+            with blobfile.BlobFile(self.file_path, "r", streaming=False) as handle:
+                for line in handle:
+                    data = json.loads(line.strip())
+                    if "messages" not in data:
+                        raise ValueError(f"Each line must include a 'messages' field. Got keys: {sorted(data.keys())}")
+                    conversations_jsonl.append(data)
+
+            dataset = datasets.Dataset.from_list(conversations_jsonl)
+            if self.shuffle_seed is not None:
+                dataset = dataset.shuffle(seed=self.shuffle_seed)
+
+            if self.test_size > 0 and len(dataset) > self.test_size:
+                test_ds = dataset.take(self.test_size)
+                train_ds = dataset.skip(self.test_size)
+            else:
+                train_ds = dataset
+                test_ds = None
+
+            train_on_what = (
+                TrainOnWhat(self.common_config.train_on_what)
+                if self.common_config.train_on_what
+                else TrainOnWhat.ALL_ASSISTANT_MESSAGES
+            )
+
+            def map_fn(row: dict):
+                return conversation_to_datum(
+                    row["messages"],
+                    self.renderer,
+                    self.common_config.max_length,
+                    train_on_what,
+                )
+
+            supervised_dataset = SupervisedDatasetFromHFDataset(
+                train_ds,
+                batch_size=self.common_config.batch_size,
+                map_fn=map_fn,
+            )
+            if test_ds is not None:
+                test_dataset = SupervisedDatasetFromHFDataset(
+                    test_ds,
+                    batch_size=len(test_ds),
+                    map_fn=map_fn,
+                )
+            else:
+                test_dataset = None
+
+            return supervised_dataset, test_dataset
+
     renderer_name = args.renderer_name or model_info.get_recommended_renderer_name(args.model_name)
     common_config = ChatDatasetBuilderCommonConfig(
         model_name_for_tokenizer=args.model_name,
         renderer_name=renderer_name,
         max_length=args.max_length,
         batch_size=args.batch_size,
-        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        train_on_what=getattr(TrainOnWhat, "LAST_ASSISTANT_MESSAGE", TrainOnWhat.ALL_ASSISTANT_MESSAGES),
     )
-    dataset_builder = FromConversationFileBuilder(
+    dataset_builder = VisionConversationFileBuilder(
         common_config=common_config,
         file_path=str(output_jsonl),
         test_size=0,
