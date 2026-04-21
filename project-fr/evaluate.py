@@ -44,9 +44,9 @@ def compute_tar_at_far(
     results = {}
     for far in far_targets:
         idx = np.argmin(np.abs(fpr - far))
-        results[f"TAR@FAR={far:.0e}"] = tpr[idx] * 100
+        results[f"TAR@FAR={far:.0e}"] = float(tpr[idx] * 100)
 
-    results["AUC"] = auc(fpr, tpr) * 100
+    results["AUC"] = float(auc(fpr, tpr) * 100)
     return results
 
 
@@ -90,9 +90,9 @@ def evaluate_dataset(
     results = {
         "performance": performance,
         "submission_info": {
-            "num_predicted_pairs": len(pred_df),
-            "num_gt_pairs": len(gt_df),
-            "num_matched_pairs": len(merged) - missing,
+            "num_predicted_pairs": int(len(pred_df)),
+            "num_gt_pairs": int(len(gt_df)),
+            "num_matched_pairs": int(len(merged) - missing),
             "num_missing_pairs": int(missing),
             "num_positive_pairs": int(labels.sum()),
             "num_negative_pairs": int((labels == 0).sum()),

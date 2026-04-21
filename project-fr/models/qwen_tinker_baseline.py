@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Generate face-verification prediction CSVs with a Tinker-hosted Qwen3-VL checkpoint.
 
-This preserves the repository's prediction interface:
+This script preserves the repository's prediction interface:
 
     template_id_1,template_id_2,score
 
-Unlike the embedding baselines, scoring is performed by querying a multimodal
-Qwen3-VL checkpoint through Tinker's native sampling client plus the same
-renderer family used during fine-tuning.
+Unlike the image-embedding baselines, Qwen/Tinker does not expose a native
+embedding endpoint here. To scale more like the other models, this script:
+
+1. Runs the VLM once per template to obtain a compact descriptor.
+2. Converts descriptors into fixed-size template feature vectors.
+3. Scores all benchmark pairs offline with batched cosine similarity.
+
+This changes the expensive step from O(num_pairs) VLM calls to O(num_templates)
+VLM calls, then uses the same cheap pair-scoring pattern as the ResNet50 and
+MobileFaceNet baselines.
 """
 
 from __future__ import annotations
@@ -18,20 +25,30 @@ import json
 import mimetypes
 import os
 import re
+import string
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import HashingVectorizer
 from tqdm import tqdm
 
 
 SYSTEM_PROMPT = (
-    "You are a face verification model. Determine whether the provided face images "
-    "belong to the same identity. Respond with exactly one lowercase word: same or different."
+    "You are a face representation model. Summarize only stable, visible, non-sensitive "
+    "identity cues from the provided face template. Do not infer race, ethnicity, religion, "
+    "health, age, or gender. Return exactly one compact line of semicolon-separated key=value "
+    "tokens using only these keys: hair, hairline, brows, eyes, nose, lips, jaw, facial_hair, "
+    "eyewear, marks, face_shape, overall. Use short values. If unclear, use unknown."
 )
-LABEL_RE = re.compile(r"\b(same|different)\b", re.IGNORECASE)
+DEFAULT_DESCRIPTOR = (
+    "hair=unknown;hairline=unknown;brows=unknown;eyes=unknown;nose=unknown;lips=unknown;"
+    "jaw=unknown;facial_hair=unknown;eyewear=unknown;marks=unknown;face_shape=unknown;overall=unknown"
+)
+PUNCT_TRANSLATION = str.maketrans({char: " " for char in string.punctuation if char not in "=;:-_"})
 
 
 def resolve_path(root: str | Path, value: str | None, default_name: str | None = None) -> Path:
@@ -71,66 +88,23 @@ def select_template_images(template_to_images: dict[int, list[Path]], template_i
     return images[:max_images]
 
 
-def extract_label(text: str) -> str | None:
-    match = LABEL_RE.search(text.strip())
-    if not match:
-        return None
-    return match.group(1).lower()
-
-
-def label_to_score(label: str | None, unknown_score: float) -> float:
-    if label == "same":
-        return 1.0
-    if label == "different":
-        return 0.0
-    return unknown_score
-
-
-def build_template_messages(template_a_images: list[Path], template_b_images: list[Path]) -> list[dict[str, Any]]:
-    user_content: list[dict[str, Any]] = [
-        {"type": "text", "text": "Template A face images:"},
-    ]
-    for image_path in template_a_images:
+def build_descriptor_messages(template_images: list[Path]) -> list[dict[str, Any]]:
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": "Template face images:"}]
+    for image_path in template_images:
         user_content.append({"type": "image", "image": image_to_data_uri(image_path)})
-
-    user_content.append({"type": "text", "text": "Template B face images:"})
-    for image_path in template_b_images:
-        user_content.append({"type": "image", "image": image_to_data_uri(image_path)})
-
     user_content.append(
         {
             "type": "text",
             "text": (
-                "Do template A and template B belong to the same identity? "
-                "Respond with exactly one lowercase word: same or different."
+                "Return one line of semicolon-separated key=value tokens with these exact keys: "
+                "hair; hairline; brows; eyes; nose; lips; jaw; facial_hair; eyewear; marks; "
+                "face_shape; overall. Use unknown if needed. Return only the descriptor line."
             ),
         }
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
-    ]
-
-
-def build_image_pair_messages(left_image: Path, right_image: Path) -> list[dict[str, Any]]:
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Image A:"},
-                {"type": "image", "image": image_to_data_uri(left_image)},
-                {"type": "text", "text": "Image B:"},
-                {"type": "image", "image": image_to_data_uri(right_image)},
-                {
-                    "type": "text",
-                    "text": (
-                        "Do these two face images belong to the same identity? "
-                        "Respond with exactly one lowercase word: same or different."
-                    ),
-                },
-            ],
-        },
     ]
 
 
@@ -152,6 +126,27 @@ def extract_message_text(message: Any) -> str:
     if isinstance(message, list):
         return "".join(extract_message_text(part) for part in message)
     return str(message)
+
+
+def normalize_descriptor_text(text: str) -> str:
+    text = text.strip().lower()
+    if not text:
+        return DEFAULT_DESCRIPTOR
+
+    first_line = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            first_line = line
+            break
+    if not first_line:
+        first_line = text
+
+    first_line = first_line.translate(PUNCT_TRANSLATION)
+    first_line = re.sub(r"\s+", " ", first_line).strip()
+    if "=" not in first_line and ";" not in first_line:
+        return first_line or DEFAULT_DESCRIPTOR
+    return first_line or DEFAULT_DESCRIPTOR
 
 
 def build_sampling_stack(model_path: str, api_key: str) -> tuple[Any, Any, Any, str]:
@@ -187,7 +182,7 @@ def build_sampling_stack(model_path: str, api_key: str) -> tuple[Any, Any, Any, 
     )
     sampling_client = service_client.create_sampling_client(model_path=model_path)
     sampling_params = SamplingParams(
-        max_tokens=8,
+        max_tokens=128,
         temperature=0.0,
         top_p=1.0,
         stop=renderer.get_stop_sequences(),
@@ -195,14 +190,14 @@ def build_sampling_stack(model_path: str, api_key: str) -> tuple[Any, Any, Any, 
     return sampling_client, renderer, sampling_params, base_model
 
 
-def request_label(
+def request_descriptor(
     sampling_client: Any,
     renderer: Any,
     sampling_params: Any,
     messages: list[dict[str, Any]],
     max_retries: int,
     sleep_seconds: float,
-) -> tuple[str | None, str]:
+) -> tuple[str, str]:
     last_text = ""
     for _ in range(max_retries):
         prompt = renderer.build_generation_prompt(messages)
@@ -211,82 +206,88 @@ def request_label(
             sampling_params=sampling_params,
             num_samples=1,
         ).result()
-        sampled_message, parse_success = renderer.parse_response(output.sequences[0].tokens)
+        sampled_message, _parse_success = renderer.parse_response(output.sequences[0].tokens)
         raw_text = extract_message_text(sampled_message).strip()
         last_text = raw_text
-        if parse_success:
-            label = extract_label(raw_text)
-            if label is not None:
-                return label, raw_text
-        else:
-            label = extract_label(raw_text)
-            if label is not None:
-                return label, raw_text
+        descriptor = normalize_descriptor_text(raw_text)
+        if descriptor:
+            return descriptor, raw_text
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
-    return None, last_text
+    return normalize_descriptor_text(last_text), last_text
 
 
-def iter_image_pairs(template_a_images: Iterable[Path], template_b_images: Iterable[Path]) -> Iterable[tuple[Path, Path]]:
-    for left_image in template_a_images:
-        for right_image in template_b_images:
-            yield left_image, right_image
+def cache_path_for_output(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_template_descriptors.jsonl")
 
 
-def score_template_pair(
-    sampling_client: Any,
-    renderer: Any,
-    sampling_params: Any,
-    template_a_images: list[Path],
-    template_b_images: list[Path],
-    compare_mode: str,
-    unknown_score: float,
-    max_retries: int,
-    sleep_seconds: float,
-) -> tuple[float, dict[str, Any]]:
-    if compare_mode == "template":
-        label, raw_text = request_label(
-            sampling_client=sampling_client,
-            renderer=renderer,
-            sampling_params=sampling_params,
-            messages=build_template_messages(template_a_images, template_b_images),
-            max_retries=max_retries,
-            sleep_seconds=sleep_seconds,
-        )
-        return label_to_score(label, unknown_score), {
-            "mode": "template",
-            "raw_text": raw_text,
-            "label": label,
-        }
+def load_descriptor_cache(
+    cache_path: Path,
+    model_path: str,
+    images_per_template: int,
+) -> dict[int, dict[str, Any]]:
+    cached: dict[int, dict[str, Any]] = {}
+    if not cache_path.exists():
+        return cached
 
-    image_pair_scores = []
-    raw_outputs = []
-    for left_image, right_image in iter_image_pairs(template_a_images, template_b_images):
-        label, raw_text = request_label(
-            sampling_client=sampling_client,
-            renderer=renderer,
-            sampling_params=sampling_params,
-            messages=build_image_pair_messages(left_image, right_image),
-            max_retries=max_retries,
-            sleep_seconds=sleep_seconds,
-        )
-        image_pair_scores.append(label_to_score(label, unknown_score))
-        raw_outputs.append(
-            {
-                "left_image": str(left_image),
-                "right_image": str(right_image),
-                "label": label,
-                "raw_text": raw_text,
-            }
-        )
+    with cache_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("model_path") != model_path:
+                continue
+            if int(record.get("images_per_template", -1)) != images_per_template:
+                continue
+            cached[int(record["template_id"])] = record
+    return cached
 
-    if not image_pair_scores:
-        return unknown_score, {"mode": "image_pairs", "raw_outputs": []}
 
-    return sum(image_pair_scores) / len(image_pair_scores), {
-        "mode": "image_pairs",
-        "raw_outputs": raw_outputs,
-    }
+def append_descriptor_records(cache_path: Path, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def build_descriptor_feature_matrix(
+    template_ids: list[int],
+    descriptor_texts: list[str],
+    feature_dim: int,
+) -> tuple[dict[int, int], np.ndarray]:
+    vectorizer = HashingVectorizer(
+        n_features=feature_dim,
+        alternate_sign=False,
+        norm="l2",
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        lowercase=True,
+    )
+    feature_matrix = vectorizer.transform(descriptor_texts).astype(np.float32).toarray()
+    tid_to_idx = {template_id: idx for idx, template_id in enumerate(template_ids)}
+    return tid_to_idx, feature_matrix
+
+
+def score_all_pairs(
+    pairs_df: pd.DataFrame,
+    tid_to_idx: dict[int, int],
+    feature_matrix: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    t1s = pairs_df["template_id_1"].values
+    t2s = pairs_df["template_id_2"].values
+    scores = np.zeros(len(pairs_df), dtype=np.float32)
+
+    for start in tqdm(range(0, len(pairs_df), batch_size), desc="Scoring"):
+        end = min(start + batch_size, len(pairs_df))
+        idx1 = np.fromiter((tid_to_idx[int(tid)] for tid in t1s[start:end]), dtype=np.int64, count=end - start)
+        idx2 = np.fromiter((tid_to_idx[int(tid)] for tid in t2s[start:end]), dtype=np.int64, count=end - start)
+        scores[start:end] = np.sum(feature_matrix[idx1] * feature_matrix[idx2], axis=1)
+
+    return scores
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,13 +309,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="template",
         choices=["template", "image_pairs"],
-        help="Template-level query or average over all selected image pairs",
+        help="Accepted for notebook compatibility. Template-feature scoring ignores this setting.",
     )
-    parser.add_argument("--unknown_score", type=float, default=0.5, help="Fallback score when the label cannot be parsed")
+    parser.add_argument("--unknown_score", type=float, default=0.5, help="Unused in template-feature mode; kept for compatibility")
     parser.add_argument("--max_retries", type=int, default=2, help="Retries when the model output is unparsable")
     parser.add_argument("--sleep_seconds", type=float, default=0.0, help="Optional delay between retries")
     parser.add_argument("--limit_pairs", type=int, default=None, help="Optional limit for smoke tests")
-    parser.add_argument("--debug_jsonl", type=str, default=None, help="Optional JSONL file for raw model outputs")
+    parser.add_argument("--debug_jsonl", type=str, default=None, help="Optional JSONL cache/debug path for per-template descriptors")
+    parser.add_argument("--feature_dim", type=int, default=1024, help="Descriptor hashing dimension")
+    parser.add_argument("--score_batch", type=int, default=500_000, help="Offline pair scoring batch size")
     return parser.parse_args()
 
 
@@ -337,65 +340,87 @@ def main() -> None:
         pairs_df = pairs_df.head(args.limit_pairs).copy()
 
     template_to_images = build_template_to_images(metadata_df, dataset_root)
+    required_template_ids = sorted(
+        set(int(tid) for tid in pairs_df["template_id_1"].tolist())
+        | set(int(tid) for tid in pairs_df["template_id_2"].tolist())
+    )
+
     sampling_client, renderer, sampling_params, base_model = build_sampling_stack(args.model_path, api_key)
+
+    cache_path = Path(args.debug_jsonl) if args.debug_jsonl else cache_path_for_output(output_path)
+    cached_records = load_descriptor_cache(
+        cache_path=cache_path,
+        model_path=args.model_path,
+        images_per_template=args.images_per_template,
+    )
 
     print(f"Dataset root: {dataset_root}")
     print(f"Metadata: {metadata_path}")
     print(f"Pairs: {pairs_path}")
     print(f"Model path: {args.model_path}")
     print(f"Base model: {base_model}")
-    print(f"Compare mode: {args.compare_mode}")
+    print(f"Templates required: {len(required_template_ids)}")
     print(f"Pairs to score: {len(pairs_df)}")
+    print(f"Template descriptor cache: {cache_path}")
+    print(f"Feature dimension: {args.feature_dim}")
 
-    rows = []
-    debug_records = []
-    for row in tqdm(pairs_df.itertuples(index=False), total=len(pairs_df), desc="Scoring pairs"):
-        template_id_1 = int(row.template_id_1)
-        template_id_2 = int(row.template_id_2)
+    new_records: list[dict[str, Any]] = []
+    descriptor_by_template: dict[int, str] = {}
+    for template_id in tqdm(required_template_ids, desc="Encoding templates"):
+        cached = cached_records.get(template_id)
+        if cached is not None:
+            descriptor_by_template[template_id] = str(cached["descriptor"])
+            continue
 
-        template_a_images = select_template_images(template_to_images, template_id_1, args.images_per_template)
-        template_b_images = select_template_images(template_to_images, template_id_2, args.images_per_template)
-        score, debug_info = score_template_pair(
+        template_images = select_template_images(template_to_images, template_id, args.images_per_template)
+        descriptor, raw_text = request_descriptor(
             sampling_client=sampling_client,
             renderer=renderer,
             sampling_params=sampling_params,
-            template_a_images=template_a_images,
-            template_b_images=template_b_images,
-            compare_mode=args.compare_mode,
-            unknown_score=args.unknown_score,
+            messages=build_descriptor_messages(template_images),
             max_retries=args.max_retries,
             sleep_seconds=args.sleep_seconds,
         )
-        rows.append(
+        descriptor_by_template[template_id] = descriptor
+        new_records.append(
             {
-                "template_id_1": template_id_1,
-                "template_id_2": template_id_2,
-                "score": float(score),
+                "template_id": int(template_id),
+                "model_path": args.model_path,
+                "images_per_template": int(args.images_per_template),
+                "descriptor": descriptor,
+                "raw_text": raw_text,
+                "images": [str(path) for path in template_images],
             }
         )
-        if args.debug_jsonl:
-            debug_records.append(
-                {
-                    "template_id_1": template_id_1,
-                    "template_id_2": template_id_2,
-                    "score": float(score),
-                    "template_a_images": [str(path) for path in template_a_images],
-                    "template_b_images": [str(path) for path in template_b_images],
-                    "debug": debug_info,
-                }
-            )
+        if len(new_records) >= 100:
+            append_descriptor_records(cache_path, new_records)
+            new_records = []
 
-    out_df = pd.DataFrame(rows)
+    append_descriptor_records(cache_path, new_records)
+
+    template_ids = required_template_ids
+    descriptor_texts = [descriptor_by_template[template_id] for template_id in template_ids]
+    tid_to_idx, feature_matrix = build_descriptor_feature_matrix(
+        template_ids=template_ids,
+        descriptor_texts=descriptor_texts,
+        feature_dim=args.feature_dim,
+    )
+    scores = score_all_pairs(
+        pairs_df=pairs_df,
+        tid_to_idx=tid_to_idx,
+        feature_matrix=feature_matrix,
+        batch_size=args.score_batch,
+    )
+
+    out_df = pd.DataFrame(
+        {
+            "template_id_1": pairs_df["template_id_1"].values,
+            "template_id_2": pairs_df["template_id_2"].values,
+            "score": scores,
+        }
+    )
     out_df.to_csv(output_path, index=False)
     print(f"Predictions saved to: {output_path} ({len(out_df)} pairs)")
-
-    if args.debug_jsonl:
-        debug_path = Path(args.debug_jsonl)
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        with debug_path.open("w", encoding="utf-8") as handle:
-            for record in debug_records:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        print(f"Debug records saved to: {debug_path}")
 
 
 if __name__ == "__main__":
