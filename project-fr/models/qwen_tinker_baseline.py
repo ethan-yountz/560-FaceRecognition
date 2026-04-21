@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """Generate face-verification prediction CSVs with a Tinker-hosted Qwen3-VL checkpoint.
 
-This script preserves the repository's prediction interface:
+This preserves the repository's prediction interface:
 
     template_id_1,template_id_2,score
 
 Unlike the embedding baselines, scoring is performed by querying a multimodal
-Qwen3-VL checkpoint through Tinker's OpenAI-compatible inference endpoint.
-
-Practical note:
-    This is much slower than the ResNet50 or MobileFaceNet paths. It is mainly
-    intended for smaller validation runs, smoke tests, and early capability
-    checks rather than full multi-million-pair benchmark sweeps.
+Qwen3-VL checkpoint through Tinker's native sampling client plus the same
+renderer family used during fine-tuning.
 """
 
 from __future__ import annotations
@@ -19,7 +15,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import math
 import mimetypes
 import os
 import re
@@ -32,7 +27,6 @@ import pandas as pd
 from tqdm import tqdm
 
 
-BASE_URL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 SYSTEM_PROMPT = (
     "You are a face verification model. Determine whether the provided face images "
     "belong to the same identity. Respond with exactly one lowercase word: same or different."
@@ -48,7 +42,9 @@ def resolve_path(root: str | Path, value: str | None, default_name: str | None =
         return root / default_name
 
     path = Path(value)
-    if path.exists():
+    if path.exists() or path.is_absolute():
+        return path
+    if path.parts[: len(root.parts)] == root.parts:
         return path
     return root / value
 
@@ -90,16 +86,16 @@ def label_to_score(label: str | None, unknown_score: float) -> float:
     return unknown_score
 
 
-def build_template_messages(template_a_images: list[Path], template_b_images: list[Path]) -> list[dict]:
-    user_content: list[dict] = [
+def build_template_messages(template_a_images: list[Path], template_b_images: list[Path]) -> list[dict[str, Any]]:
+    user_content: list[dict[str, Any]] = [
         {"type": "text", "text": "Template A face images:"},
     ]
     for image_path in template_a_images:
-        user_content.append({"type": "image_url", "image_url": {"url": image_to_data_uri(image_path)}})
+        user_content.append({"type": "image", "image": image_to_data_uri(image_path)})
 
     user_content.append({"type": "text", "text": "Template B face images:"})
     for image_path in template_b_images:
-        user_content.append({"type": "image_url", "image_url": {"url": image_to_data_uri(image_path)}})
+        user_content.append({"type": "image", "image": image_to_data_uri(image_path)})
 
     user_content.append(
         {
@@ -116,51 +112,116 @@ def build_template_messages(template_a_images: list[Path], template_b_images: li
     ]
 
 
-def build_image_pair_messages(left_image: Path, right_image: Path) -> list[dict]:
+def build_image_pair_messages(left_image: Path, right_image: Path) -> list[dict[str, Any]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "Image A:"},
-                {"type": "image_url", "image_url": {"url": image_to_data_uri(left_image)}},
+                {"type": "image", "image": image_to_data_uri(left_image)},
                 {"type": "text", "text": "Image B:"},
-                {"type": "image_url", "image_url": {"url": image_to_data_uri(right_image)}},
+                {"type": "image", "image": image_to_data_uri(right_image)},
                 {
                     "type": "text",
-                    "text": "Do these two face images belong to the same identity? Respond with exactly one lowercase word: same or different.",
+                    "text": (
+                        "Do these two face images belong to the same identity? "
+                        "Respond with exactly one lowercase word: same or different."
+                    ),
                 },
             ],
         },
     ]
 
 
+def extract_message_text(message: Any) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "".join(parts)
+    if isinstance(message, list):
+        return "".join(extract_message_text(part) for part in message)
+    return str(message)
+
+
+def build_sampling_stack(model_path: str, api_key: str) -> tuple[Any, Any, Any, str]:
+    try:
+        import tinker
+        from tinker.types import SamplingParams
+        from tinker_cookbook import model_info, renderers, tokenizer_utils
+        from tinker_cookbook.image_processing_utils import get_image_processor
+    except ImportError as exc:
+        raise SystemExit(
+            "Tinker inference dependencies are not installed. Install with:\n"
+            "  pip install tinker tinker-cookbook\n"
+            f"Import failure: {exc}"
+        ) from exc
+
+    os.environ.setdefault("TINKER_API_KEY", api_key)
+
+    service_client = tinker.ServiceClient()
+    rest_client = service_client.create_rest_client()
+    weights_info = rest_client.get_weights_info_by_tinker_path(model_path).result()
+    base_model = weights_info.base_model
+    if not base_model:
+        raise ValueError(f"Could not determine base model for checkpoint: {model_path}")
+
+    tokenizer = tokenizer_utils.get_tokenizer(base_model)
+    image_processor = get_image_processor(base_model)
+    renderer_name = model_info.get_recommended_renderer_name(base_model)
+    renderer = renderers.get_renderer(
+        renderer_name,
+        tokenizer,
+        image_processor=image_processor,
+        model_name=base_model,
+    )
+    sampling_client = service_client.create_sampling_client(model_path=model_path)
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        stop=renderer.get_stop_sequences(),
+    )
+    return sampling_client, renderer, sampling_params, base_model
+
+
 def request_label(
-    client: Any,
-    model_path: str,
-    messages: list[dict],
+    sampling_client: Any,
+    renderer: Any,
+    sampling_params: Any,
+    messages: list[dict[str, Any]],
     max_retries: int,
     sleep_seconds: float,
 ) -> tuple[str | None, str]:
     last_text = ""
-    for attempt in range(max_retries):
-        response = client.chat.completions.create(
-            model=model_path,
-            messages=messages,
-            max_tokens=4,
-            temperature=0.0,
-            top_p=1.0,
-        )
-        text = response.choices[0].message.content or ""
-        if isinstance(text, list):
-            text = "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in text
-            )
-        last_text = str(text).strip()
-        label = extract_label(last_text)
-        if label is not None:
-            return label, last_text
+    for _ in range(max_retries):
+        prompt = renderer.build_generation_prompt(messages)
+        output = sampling_client.sample(
+            prompt,
+            sampling_params=sampling_params,
+            num_samples=1,
+        ).result()
+        sampled_message, parse_success = renderer.parse_response(output.sequences[0].tokens)
+        raw_text = extract_message_text(sampled_message).strip()
+        last_text = raw_text
+        if parse_success:
+            label = extract_label(raw_text)
+            if label is not None:
+                return label, raw_text
+        else:
+            label = extract_label(raw_text)
+            if label is not None:
+                return label, raw_text
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
     return None, last_text
@@ -173,19 +234,21 @@ def iter_image_pairs(template_a_images: Iterable[Path], template_b_images: Itera
 
 
 def score_template_pair(
-    client: Any,
-    model_path: str,
+    sampling_client: Any,
+    renderer: Any,
+    sampling_params: Any,
     template_a_images: list[Path],
     template_b_images: list[Path],
     compare_mode: str,
     unknown_score: float,
     max_retries: int,
     sleep_seconds: float,
-) -> tuple[float, dict]:
+) -> tuple[float, dict[str, Any]]:
     if compare_mode == "template":
         label, raw_text = request_label(
-            client=client,
-            model_path=model_path,
+            sampling_client=sampling_client,
+            renderer=renderer,
+            sampling_params=sampling_params,
             messages=build_template_messages(template_a_images, template_b_images),
             max_retries=max_retries,
             sleep_seconds=sleep_seconds,
@@ -200,8 +263,9 @@ def score_template_pair(
     raw_outputs = []
     for left_image, right_image in iter_image_pairs(template_a_images, template_b_images):
         label, raw_text = request_label(
-            client=client,
-            model_path=model_path,
+            sampling_client=sampling_client,
+            renderer=renderer,
+            sampling_params=sampling_params,
             messages=build_image_pair_messages(left_image, right_image),
             max_retries=max_retries,
             sleep_seconds=sleep_seconds,
@@ -233,10 +297,9 @@ def parse_args() -> argparse.Namespace:
         "--model_path",
         type=str,
         required=True,
-        help="Tinker sampler checkpoint path, e.g. tinker://.../sampler_weights/000080",
+        help="Tinker sampler checkpoint path, e.g. tinker://.../sampler_weights/final",
     )
     parser.add_argument("--api_key", type=str, default=None, help="Tinker API key. Defaults to TINKER_API_KEY env var.")
-    parser.add_argument("--base_url", type=str, default=BASE_URL, help="OpenAI-compatible Tinker base URL")
     parser.add_argument("--metadata", type=str, default=None, help="Evaluation metadata parquet. Defaults to test.parquet")
     parser.add_argument("--pairs", type=str, default=None, help="Pairs parquet. Defaults to pairs.parquet")
     parser.add_argument("--images_per_template", type=int, default=2, help="Images to include per template")
@@ -258,14 +321,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise SystemExit(
-            "The 'openai' package is required for Qwen/Tinker inference. "
-            "Install it with: pip install openai"
-        ) from exc
-
     api_key = args.api_key or os.environ.get("TINKER_API_KEY")
     if not api_key:
         raise ValueError("Provide --api_key or set TINKER_API_KEY in the environment.")
@@ -282,12 +337,13 @@ def main() -> None:
         pairs_df = pairs_df.head(args.limit_pairs).copy()
 
     template_to_images = build_template_to_images(metadata_df, dataset_root)
-    client = OpenAI(base_url=args.base_url, api_key=api_key)
+    sampling_client, renderer, sampling_params, base_model = build_sampling_stack(args.model_path, api_key)
 
     print(f"Dataset root: {dataset_root}")
     print(f"Metadata: {metadata_path}")
     print(f"Pairs: {pairs_path}")
     print(f"Model path: {args.model_path}")
+    print(f"Base model: {base_model}")
     print(f"Compare mode: {args.compare_mode}")
     print(f"Pairs to score: {len(pairs_df)}")
 
@@ -300,8 +356,9 @@ def main() -> None:
         template_a_images = select_template_images(template_to_images, template_id_1, args.images_per_template)
         template_b_images = select_template_images(template_to_images, template_id_2, args.images_per_template)
         score, debug_info = score_template_pair(
-            client=client,
-            model_path=args.model_path,
+            sampling_client=sampling_client,
+            renderer=renderer,
+            sampling_params=sampling_params,
             template_a_images=template_a_images,
             template_b_images=template_b_images,
             compare_mode=args.compare_mode,
