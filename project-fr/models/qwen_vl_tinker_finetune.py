@@ -70,7 +70,9 @@ def resolve_path(root: str | Path, value: str | None, default_name: str | None =
         return root / default_name
 
     path = Path(value)
-    if path.exists():
+    if path.exists() or path.is_absolute():
+        return path
+    if path.parts[: len(root.parts)] == root.parts:
         return path
     return root / value
 
@@ -252,9 +254,9 @@ def build_messages_for_pair(
 
     answer = "same" if label == 1 else "different"
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
         {"role": "user", "content": user_content},
-        {"role": "assistant", "content": answer},
+        {"role": "assistant", "content": [{"type": "text", "text": answer}]},
     ]
     metadata = {
         "template_id_1": template_id_1,
@@ -309,10 +311,10 @@ def write_jsonl(path: Path, conversations: list[FaceVerificationConversation]) -
 
 def prepare_training_conversations(args: argparse.Namespace) -> tuple[list[FaceVerificationConversation], Path]:
     split_paths = default_split_paths(args.data_root)
-    train_metadata_path = args.train_metadata or str(split_paths["train_metadata"])
+    train_metadata_path = args.train_metadata or split_paths["train_metadata"]
     train_pairs_path = args.train_pairs
     if train_pairs_path is None and split_paths["train_pairs"].exists():
-        train_pairs_path = str(split_paths["train_pairs"])
+        train_pairs_path = split_paths["train_pairs"]
 
     metadata_df = load_metadata_frame(args.data_root, train_metadata_path)
     pairs_df = load_pairs_frame(args.data_root, train_pairs_path)
@@ -411,7 +413,7 @@ def train_command(args: argparse.Namespace) -> None:
         }
     )
     config = blueprint.make()
-    cli_utils.check_log_dir(config.log_path, behavior_if_exists="ask")
+    cli_utils.check_log_dir(config.log_path, behavior_if_exists="overwrite")
     asyncio.run(tinker_train.main(config))
 
 
